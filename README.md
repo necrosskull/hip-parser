@@ -40,6 +40,85 @@ docker compose up -d --build
 
 Состояние хранится в директории `./data`, смонтированной в контейнер как volume.
 
+## CI/CD в GitHub (автодеплой при коммите в `main`)
+
+В репозитории добавлен workflow [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml).
+
+Триггеры:
+
+- push в ветку `main`
+- ручной запуск через `workflow_dispatch`
+
+Что делает деплой:
+
+1. Подключается к серверу по SSH.
+2. Переходит в директорию проекта.
+3. Обновляет код до `origin/main`.
+4. Выполняет `docker compose up -d --build --remove-orphans`.
+
+### Что настроить в GitHub
+
+В `Settings -> Secrets and variables -> Actions` добавьте secrets:
+
+- `SSH_HOST` — IP/домен сервера.
+- `SSH_PORT` — SSH-порт (обычно `22`).
+- `SSH_USER` — пользователь на сервере.
+- `SSH_PRIVATE_KEY` — приватный SSH-ключ (которым GitHub Actions подключится на сервер).
+- `DEPLOY_PATH` — абсолютный путь к директории проекта на сервере, например `/opt/hip-parser`.
+- `ENV_FILE_B64` — содержимое `.env` в base64 (workflow декодирует его на сервере в файл `.env` перед запуском `docker compose`).
+
+Как подготовить `ENV_FILE_B64`:
+
+Linux/macOS:
+
+```bash
+base64 -w 0 .env
+```
+
+PowerShell (Windows):
+
+```powershell
+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-Content .env -Raw)))
+```
+
+### Что настроить на сервере
+
+1. Установить Docker и Docker Compose plugin.
+2. Создать директорию проекта и клонировать репозиторий:
+
+```bash
+sudo mkdir -p /opt/hip-parser
+sudo chown -R $USER:$USER /opt/hip-parser
+git clone https://github.com/necrosskull/hip-parser /opt/hip-parser
+cd /opt/hip-parser
+```
+
+3. `.env` вручную создавать не обязательно: workflow сам создаёт его из `ENV_FILE_B64` при каждом деплое.
+
+Если нужно проверить запуск до первого деплоя, можно временно сделать вручную:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+4. Создать директорию для состояния (если отсутствует):
+
+```bash
+mkdir -p data
+```
+
+5. Проверить первый запуск вручную:
+
+```bash
+docker compose up -d --build
+docker compose logs -f --tail=100 hip-watcher
+```
+
+6. Добавить публичный ключ для `SSH_PRIVATE_KEY` в `~/.ssh/authorized_keys` пользователя `SSH_USER`.
+
+После этого каждый commit/push в `main` будет автоматически деплоить новую версию на сервер.
+
 ## Полезные команды
 
 Одна проверка без бесконечного цикла:

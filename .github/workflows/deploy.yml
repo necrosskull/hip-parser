@@ -1,0 +1,38 @@
+name: Deploy to server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          script_stop: true
+          script: |
+            set -e
+            cd ${{ secrets.DEPLOY_PATH }}
+            git fetch --all --prune
+            git checkout main
+            git reset --hard origin/main
+            if [ -z "${{ secrets.ENV_FILE_B64 }}" ]; then
+              echo "ENV_FILE_B64 secret is empty"
+              exit 1
+            fi
+            printf '%s' '${{ secrets.ENV_FILE_B64 }}' | base64 -d > .env
+            chmod 600 .env
+            docker compose up -d --build --remove-orphans
+            docker image prune -f
