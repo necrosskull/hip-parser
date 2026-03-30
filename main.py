@@ -149,6 +149,8 @@ def run_worker(config: Config) -> None:
             "Loaded state for %s regions", len(previous_state.get("regions", {}))
         )
 
+    send_telegram_startup_alert(config)
+
     while True:
         try:
             regions = fetch_region_availability(config)
@@ -437,6 +439,63 @@ def send_telegram_error_alert(config: Config, error: Exception) -> None:
         return
 
     logging.info("Sent Telegram error alert: %s", error_type)
+
+
+def send_telegram_startup_alert(config: Config) -> None:
+    watched_regions = (
+        ", ".join(sorted(config.watched_region_slugs))
+        if config.watched_region_slugs
+        else "all"
+    )
+    mode = "single run" if config.run_once else "continuous"
+
+    message = "\n".join(
+        [
+            "<b>HIP watcher: бот запущен</b>",
+            f"<b>Время (UTC):</b> {html.escape(current_timestamp())}",
+            "",
+            "<b>Основные настройки:</b>",
+            f"- <b>Режим:</b> {html.escape(mode)}",
+            f"- <b>API:</b> {html.escape(config.options_api_url)}",
+            f"- <b>Сайт HIP:</b> {html.escape(config.hip_url)}",
+            f"- <b>Ссылка заказа:</b> {html.escape(config.order_url)}",
+            f"- <b>Интервал проверки:</b> {config.check_interval_seconds} сек.",
+            f"- <b>Timeout запроса:</b> {config.request_timeout_seconds} сек.",
+            f"- <b>Фильтр регионов:</b> {html.escape(watched_regions)}",
+            f"- <b>State path:</b> {html.escape(str(config.state_path))}",
+        ]
+    )
+
+    payload = urlencode(
+        {
+            "chat_id": config.telegram_chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=config.request_timeout_seconds) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        logging.exception("Failed to send Telegram startup alert")
+        return
+
+    if response_payload.get("ok") is not True:
+        logging.error(
+            "Telegram startup alert failed: %s",
+            response_payload.get("description", "unknown error"),
+        )
+        return
+
+    logging.info("Sent Telegram startup alert")
 
 
 def build_telegram_message(
