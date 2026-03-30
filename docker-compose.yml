@@ -1,0 +1,10 @@
+services:
+  hip-watcher:
+    build:
+      context: .
+    container_name: hip-watcher
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

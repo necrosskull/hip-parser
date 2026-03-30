@@ -1,0 +1,10 @@
+[project]
+name = "hip-parser"
+version = "0.1.0"
+description = "Poll HIP Hosting and notify Telegram when sold-out locations reopen"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
