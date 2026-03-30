@@ -18,11 +18,18 @@ NEXT_DATA_PATTERN = re.compile(
     r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
     re.DOTALL,
 )
+HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+WHITESPACE_PATTERN = re.compile(r"\s+")
 DEFAULT_HIP_URL = "https://hip.hosting/ru"
 DEFAULT_ORDER_URL = "https://my.hip.hosting/hiplets/new"
 DEFAULT_STATE_PATH = "data/state.json"
 DEFAULT_CHECK_INTERVAL_SECONDS = 300
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
+PRICE_SECTION_HEADING = "Тарифы VPS/VDS серверов"
+PRICE_SECTION_END_MARKER = " Standard Memory "
+STATUS_AVAILABLE = "AVAILABLE"
+STATUS_SOLD_OUT = "SOLD OUT"
+STATUS_PLANNED = "PLANNED"
 DEFAULT_HEADERS = {
     "User-Agent": "hip-availability-watcher/1.0 (+https://hip.hosting/ru)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -59,13 +66,17 @@ class RegionAvailability:
     country: str
     city: str | None
     available_sizes: list[SizeSummary]
-    sold_out: bool
+    status: str
 
     @property
     def display_name(self) -> str:
         if self.city:
             return f"{self.country} ({self.city})"
         return self.country
+
+    @property
+    def sold_out(self) -> bool:
+        return self.status == STATUS_SOLD_OUT
 
 
 def main() -> None:
@@ -162,7 +173,7 @@ def fetch_region_availability(config: Config) -> list[RegionAvailability]:
     if not isinstance(page_props, dict):
         raise RuntimeError("Unexpected Next.js payload structure")
 
-    return aggregate_regions(page_props)
+    return aggregate_regions(page_props, html_text)
 
 
 def extract_next_data(html_text: str) -> dict[str, Any]:
@@ -172,7 +183,9 @@ def extract_next_data(html_text: str) -> dict[str, Any]:
     return json.loads(match.group(1))
 
 
-def aggregate_regions(page_props: dict[str, Any]) -> list[RegionAvailability]:
+def aggregate_regions(
+    page_props: dict[str, Any], html_text: str
+) -> list[RegionAvailability]:
     locale_store = (
         page_props.get("_nextI18Next", {}).get("initialI18nStore", {}).get("ru", {})
     )
@@ -181,6 +194,9 @@ def aggregate_regions(page_props: dict[str, Any]) -> list[RegionAvailability]:
     )
     cities_by_region_slug = (
         locale_store.get("services", {}).get("locations", {}).get("vps", {})
+    )
+    statuses_by_region_slug = extract_region_statuses(
+        html_text, countries_by_region_slug
     )
 
     ranges = collect_ranges(page_props)
@@ -222,15 +238,18 @@ def aggregate_regions(page_props: dict[str, Any]) -> list[RegionAvailability]:
                     )
                 )
 
-    if not seen_region_slugs:
+    all_region_slugs = seen_region_slugs | set(statuses_by_region_slug)
+    if not all_region_slugs:
         raise RuntimeError("No region availability data found in HIP payload")
 
     regions: list[RegionAvailability] = []
-    for region_slug in sorted(seen_region_slugs):
-        available_sizes = sorted(
+    for region_slug in sorted(all_region_slugs):
+        raw_available_sizes = sorted(
             available_sizes_by_region.get(region_slug, []),
             key=lambda item: (item.range_name.lower(), item.monthly_price, item.slug),
         )
+        status = statuses_by_region_slug.get(region_slug, STATUS_AVAILABLE)
+        available_sizes = raw_available_sizes if status == STATUS_AVAILABLE else []
         country = str(countries_by_region_slug.get(region_slug) or region_slug)
         city_value = cities_by_region_slug.get(region_slug)
         city = str(city_value) if city_value else None
@@ -240,11 +259,68 @@ def aggregate_regions(page_props: dict[str, Any]) -> list[RegionAvailability]:
                 country=country,
                 city=city,
                 available_sizes=available_sizes,
-                sold_out=not available_sizes,
+                status=status,
             )
         )
 
     return regions
+
+
+def extract_region_statuses(
+    html_text: str, countries_by_region_slug: dict[str, Any]
+) -> dict[str, str]:
+    normalized_text = normalize_html_text(html_text)
+    section_text = extract_price_section_text(normalized_text)
+    statuses_by_region_slug: dict[str, str] = {}
+
+    for region_slug, country_value in sorted(
+        countries_by_region_slug.items(),
+        key=lambda item: len(str(item[1])),
+        reverse=True,
+    ):
+        country = str(country_value).strip()
+        if not country:
+            continue
+
+        match = re.search(
+            rf"{re.escape(country)}(?:\s+({re.escape(STATUS_SOLD_OUT)}|{re.escape(STATUS_PLANNED)}))?",
+            section_text,
+        )
+        if match is None:
+            continue
+
+        explicit_status = match.group(1)
+        if explicit_status == STATUS_SOLD_OUT:
+            statuses_by_region_slug[region_slug] = STATUS_SOLD_OUT
+        elif explicit_status == STATUS_PLANNED:
+            statuses_by_region_slug[region_slug] = STATUS_PLANNED
+        else:
+            statuses_by_region_slug[region_slug] = STATUS_AVAILABLE
+
+    if not statuses_by_region_slug:
+        raise RuntimeError("Could not parse visible region statuses from HIP page")
+
+    return statuses_by_region_slug
+
+
+def normalize_html_text(html_text: str) -> str:
+    text = HTML_TAG_PATTERN.sub(" ", html_text)
+    text = html.unescape(text)
+    text = WHITESPACE_PATTERN.sub(" ", text)
+    return f" {text.strip()} "
+
+
+def extract_price_section_text(normalized_text: str) -> str:
+    start_index = normalized_text.find(PRICE_SECTION_HEADING)
+    if start_index == -1:
+        raise RuntimeError("Could not find the pricing section in HIP page text")
+
+    tail_text = normalized_text[start_index:]
+    end_index = tail_text.find(PRICE_SECTION_END_MARKER)
+    if end_index == -1:
+        raise RuntimeError("Could not isolate the visible location status section")
+
+    return tail_text[:end_index]
 
 
 def collect_ranges(page_props: dict[str, Any]) -> list[dict[str, Any]]:
@@ -295,6 +371,7 @@ def build_state(regions: list[RegionAvailability]) -> dict[str, Any]:
             region.slug: {
                 "country": region.country,
                 "city": region.city,
+                "status": region.status,
                 "sold_out": region.sold_out,
                 "available_count": len(region.available_sizes),
             }
@@ -333,7 +410,13 @@ def find_reopened_regions(
         if not isinstance(previous_region, dict):
             continue
 
-        if previous_region.get("sold_out") is True and region.sold_out is False:
+        previous_status = str(
+            previous_region.get("status")
+            or (
+                STATUS_SOLD_OUT if previous_region.get("sold_out") else STATUS_AVAILABLE
+            )
+        )
+        if previous_status != STATUS_AVAILABLE and region.status == STATUS_AVAILABLE:
             reopened_regions.append(region)
 
     return reopened_regions
