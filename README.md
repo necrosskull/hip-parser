@@ -1,6 +1,6 @@
 # HIP availability watcher
 
-Воркер опрашивает [https://hip.hosting/ru](https://hip.hosting/ru), читает встроенный `__NEXT_DATA__` JSON и следит за регионами, которые были в состоянии `sold out`.
+Воркер опрашивает API [https://api.hip.hosting/hiplet/rpc/new-options](https://api.hip.hosting/hiplet/rpc/new-options) и следит за регионами, которые были в состоянии `sold out`.
 
 Когда регион снова становится доступен для покупки, воркер отправляет сообщение в Telegram с названием локации и краткой сводкой по доступным конфигурациям.
 
@@ -15,7 +15,8 @@
 
 Необязательные:
 
-- `HIP_URL` - URL страницы для опроса. По умолчанию `https://hip.hosting/ru`.
+- `HIP_OPTIONS_API_URL` - URL API для опроса. По умолчанию `https://api.hip.hosting/hiplet/rpc/new-options`.
+- `HIP_URL` - ссылка на сайт HIP, которая добавляется в уведомление. По умолчанию `https://hip.hosting/ru`.
 - `ORDER_URL` - ссылка, которую добавлять в уведомление. По умолчанию `https://my.hip.hosting/hiplets/new`.
 - `CHECK_INTERVAL_SECONDS` - интервал опроса в секундах. По умолчанию `300`.
 - `REQUEST_TIMEOUT_SECONDS` - HTTP timeout в секундах. По умолчанию `20`.

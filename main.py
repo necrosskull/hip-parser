@@ -4,7 +4,6 @@ import html
 import json
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,34 +13,27 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-NEXT_DATA_PATTERN = re.compile(
-    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-    re.DOTALL,
-)
-HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
-WHITESPACE_PATTERN = re.compile(r"\s+")
 DEFAULT_HIP_URL = "https://hip.hosting/ru"
+DEFAULT_OPTIONS_API_URL = "https://api.hip.hosting/hiplet/rpc/new-options"
 DEFAULT_ORDER_URL = "https://my.hip.hosting/hiplets/new"
 DEFAULT_STATE_PATH = "data/state.json"
 DEFAULT_CHECK_INTERVAL_SECONDS = 300
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
-PRICE_SECTION_HEADING = "Тарифы VPS/VDS серверов"
-PRICE_SECTION_END_MARKER = " Standard Memory "
 STATUS_AVAILABLE = "AVAILABLE"
 STATUS_SOLD_OUT = "SOLD OUT"
 STATUS_PLANNED = "PLANNED"
-DEFAULT_HEADERS = {
+DEFAULT_OPTIONS_API_HEADERS = {
     "User-Agent": "hip-availability-watcher/1.0 (+https://hip.hosting/ru)",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru,en;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://my.hip.hosting",
+    "Referer": "https://my.hip.hosting/",
 }
 
 
 @dataclass(slots=True)
 class Config:
     hip_url: str
+    options_api_url: str
     order_url: str
     telegram_bot_token: str
     telegram_chat_id: str
@@ -89,6 +81,8 @@ def main() -> None:
 
 
 def load_config() -> Config:
+    load_dotenv_file(Path(".env"))
+
     telegram_bot_token = get_required_env("TELEGRAM_BOT_TOKEN")
     telegram_chat_id = get_required_env("TELEGRAM_CHAT_ID")
     state_path = Path(os.getenv("STATE_PATH", DEFAULT_STATE_PATH))
@@ -96,6 +90,7 @@ def load_config() -> Config:
 
     return Config(
         hip_url=os.getenv("HIP_URL", DEFAULT_HIP_URL),
+        options_api_url=os.getenv("HIP_OPTIONS_API_URL", DEFAULT_OPTIONS_API_URL),
         order_url=os.getenv("ORDER_URL", DEFAULT_ORDER_URL),
         telegram_bot_token=telegram_bot_token,
         telegram_chat_id=telegram_chat_id,
@@ -111,6 +106,37 @@ def load_config() -> Config:
         watched_region_slugs=watched_region_slugs,
         run_once=parse_bool(os.getenv("RUN_ONCE", "false")),
     )
+
+
+def load_dotenv_file(dotenv_path: Path) -> None:
+    if not dotenv_path.exists():
+        return
+
+    with dotenv_path.open("r", encoding="utf-8") as file_handle:
+        for raw_line in file_handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if line.startswith("export "):
+                line = line[7:].strip()
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+
+            os.environ[key] = parse_dotenv_value(value)
+
+
+def parse_dotenv_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
 
 
 def run_worker(config: Config) -> None:
@@ -148,8 +174,9 @@ def run_worker(config: Config) -> None:
 
                 save_state(config.state_path, current_state)
                 previous_state = current_state
-        except Exception:
+        except Exception as error:
             logging.exception("Polling iteration failed")
+            send_telegram_error_alert(config, error)
 
         if config.run_once:
             return
@@ -158,48 +185,45 @@ def run_worker(config: Config) -> None:
 
 
 def fetch_region_availability(config: Config) -> list[RegionAvailability]:
-    request = Request(config.hip_url, headers=DEFAULT_HEADERS)
+    request = Request(
+        config.options_api_url,
+        data=b"",
+        headers=DEFAULT_OPTIONS_API_HEADERS,
+        method="POST",
+    )
     try:
         with urlopen(request, timeout=config.request_timeout_seconds) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            html_text = response.read().decode(charset)
+            response_text = response.read().decode(charset)
     except HTTPError as error:
         raise RuntimeError(f"HIP returned HTTP {error.code}") from error
     except URLError as error:
         raise RuntimeError(f"Failed to reach HIP: {error.reason}") from error
 
-    next_data = extract_next_data(html_text)
-    page_props = next_data.get("props", {}).get("pageProps", {})
-    if not isinstance(page_props, dict):
-        raise RuntimeError("Unexpected Next.js payload structure")
+    payload = json.loads(response_text)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected API payload structure")
 
-    return aggregate_regions(page_props, html_text)
-
-
-def extract_next_data(html_text: str) -> dict[str, Any]:
-    match = NEXT_DATA_PATTERN.search(html_text)
-    if match is None:
-        raise RuntimeError("Could not locate __NEXT_DATA__ payload in HIP HTML")
-    return json.loads(match.group(1))
+    return aggregate_regions(payload)
 
 
-def aggregate_regions(
-    page_props: dict[str, Any], html_text: str
-) -> list[RegionAvailability]:
-    locale_store = (
-        page_props.get("_nextI18Next", {}).get("initialI18nStore", {}).get("ru", {})
-    )
-    countries_by_region_slug = locale_store.get("countries", {}).get(
-        "by_region_slug", {}
-    )
-    cities_by_region_slug = (
-        locale_store.get("services", {}).get("locations", {}).get("vps", {})
-    )
-    statuses_by_region_slug = extract_region_statuses(
-        html_text, countries_by_region_slug
-    )
+def aggregate_regions(payload: dict[str, Any]) -> list[RegionAvailability]:
+    regions_payload = payload.get("regions", [])
+    ranges = payload.get("ranges", [])
+    if not isinstance(regions_payload, list) or not isinstance(ranges, list):
+        raise RuntimeError("API payload does not contain expected regions/ranges")
 
-    ranges = collect_ranges(page_props)
+    region_info_by_slug: dict[str, dict[str, Any]] = {}
+    statuses_by_region_slug: dict[str, str] = {}
+    for item in regions_payload:
+        if not isinstance(item, dict):
+            continue
+        region_slug = str(item.get("slug") or "").strip()
+        if not region_slug:
+            continue
+        region_info_by_slug[region_slug] = item
+        statuses_by_region_slug[region_slug] = parse_region_status(item)
+
     seen_region_slugs: set[str] = set()
     available_sizes_by_region: dict[str, list[SizeSummary]] = {}
 
@@ -244,15 +268,18 @@ def aggregate_regions(
 
     regions: list[RegionAvailability] = []
     for region_slug in sorted(all_region_slugs):
+        region_info = region_info_by_slug.get(region_slug, {})
         raw_available_sizes = sorted(
             available_sizes_by_region.get(region_slug, []),
             key=lambda item: (item.range_name.lower(), item.monthly_price, item.slug),
         )
         status = statuses_by_region_slug.get(region_slug, STATUS_AVAILABLE)
         available_sizes = raw_available_sizes if status == STATUS_AVAILABLE else []
-        country = str(countries_by_region_slug.get(region_slug) or region_slug)
-        city_value = cities_by_region_slug.get(region_slug)
-        city = str(city_value) if city_value else None
+
+        country_code = str(region_info.get("country_code") or "").strip()
+        country = country_code.upper() if country_code else region_slug
+        city_value = region_info.get("name")
+        city = str(city_value).strip() if city_value else None
         regions.append(
             RegionAvailability(
                 slug=region_slug,
@@ -266,102 +293,15 @@ def aggregate_regions(
     return regions
 
 
-def extract_region_statuses(
-    html_text: str, countries_by_region_slug: dict[str, Any]
-) -> dict[str, str]:
-    normalized_text = normalize_html_text(html_text)
-    section_text = extract_price_section_text(normalized_text)
-    statuses_by_region_slug: dict[str, str] = {}
+def parse_region_status(region_definition: dict[str, Any]) -> str:
+    is_disabled = bool(region_definition.get("is_disabled"))
+    if not is_disabled:
+        return STATUS_AVAILABLE
 
-    for region_slug, country_value in sorted(
-        countries_by_region_slug.items(),
-        key=lambda item: len(str(item[1])),
-        reverse=True,
-    ):
-        country = str(country_value).strip()
-        if not country:
-            continue
-
-        match = re.search(
-            rf"{re.escape(country)}(?:\s+({re.escape(STATUS_SOLD_OUT)}|{re.escape(STATUS_PLANNED)}))?",
-            section_text,
-        )
-        if match is None:
-            continue
-
-        explicit_status = match.group(1)
-        if explicit_status == STATUS_SOLD_OUT:
-            statuses_by_region_slug[region_slug] = STATUS_SOLD_OUT
-        elif explicit_status == STATUS_PLANNED:
-            statuses_by_region_slug[region_slug] = STATUS_PLANNED
-        else:
-            statuses_by_region_slug[region_slug] = STATUS_AVAILABLE
-
-    if not statuses_by_region_slug:
-        raise RuntimeError("Could not parse visible region statuses from HIP page")
-
-    return statuses_by_region_slug
-
-
-def normalize_html_text(html_text: str) -> str:
-    text = HTML_TAG_PATTERN.sub(" ", html_text)
-    text = html.unescape(text)
-    text = WHITESPACE_PATTERN.sub(" ", text)
-    return f" {text.strip()} "
-
-
-def extract_price_section_text(normalized_text: str) -> str:
-    start_index = normalized_text.find(PRICE_SECTION_HEADING)
-    if start_index == -1:
-        raise RuntimeError("Could not find the pricing section in HIP page text")
-
-    tail_text = normalized_text[start_index:]
-    end_index = tail_text.find(PRICE_SECTION_END_MARKER)
-    if end_index == -1:
-        raise RuntimeError("Could not isolate the visible location status section")
-
-    return tail_text[:end_index]
-
-
-def collect_ranges(page_props: dict[str, Any]) -> list[dict[str, Any]]:
-    direct_ranges = page_props.get("ranges")
-    if isinstance(direct_ranges, list):
-        valid_direct_ranges = [
-            item for item in direct_ranges if is_range_definition(item)
-        ]
-        if valid_direct_ranges:
-            return valid_direct_ranges
-
-    ranges: list[dict[str, Any]] = []
-    seen_range_ids: set[str] = set()
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            if is_range_definition(node):
-                range_id = str(node.get("id") or node.get("slug") or id(node))
-                if range_id not in seen_range_ids:
-                    seen_range_ids.add(range_id)
-                    ranges.append(node)
-                return
-            for value in node.values():
-                walk(value)
-            return
-
-        if isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(page_props)
-    return ranges
-
-
-def is_range_definition(node: Any) -> bool:
-    if not isinstance(node, dict):
-        return False
-    sizes = node.get("sizes")
-    if not isinstance(sizes, list) or not sizes:
-        return False
-    return any(isinstance(item, dict) and "availabilities" in item for item in sizes)
+    disabled_message = str(region_definition.get("disabled_message") or "").upper()
+    if disabled_message == "PLANNED":
+        return STATUS_PLANNED
+    return STATUS_SOLD_OUT
 
 
 def build_state(regions: list[RegionAvailability]) -> dict[str, Any]:
@@ -453,6 +393,50 @@ def send_telegram_notification(config: Config, region: RegionAvailability) -> No
         )
 
     logging.info("Sent Telegram notification for %s", region.display_name)
+
+
+def send_telegram_error_alert(config: Config, error: Exception) -> None:
+    error_type = type(error).__name__
+    error_reason = str(error).strip() or "unknown error"
+    message = "\n".join(
+        [
+            "<b>HIP watcher: ошибка</b>",
+            f"<b>Тип:</b> {html.escape(error_type)}",
+            f"<b>Причина:</b> {html.escape(error_reason)}",
+            f"<b>Время (UTC):</b> {html.escape(current_timestamp())}",
+        ]
+    )
+
+    payload = urlencode(
+        {
+            "chat_id": config.telegram_chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=config.request_timeout_seconds) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        logging.exception("Failed to send Telegram error alert")
+        return
+
+    if response_payload.get("ok") is not True:
+        logging.error(
+            "Telegram error alert failed: %s",
+            response_payload.get("description", "unknown error"),
+        )
+        return
+
+    logging.info("Sent Telegram error alert: %s", error_type)
 
 
 def build_telegram_message(
