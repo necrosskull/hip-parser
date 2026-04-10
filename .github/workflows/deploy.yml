@@ -14,6 +14,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Create deploy archive
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude-vcs \
+            --exclude='./.env' \
+            --exclude='./.venv' \
+            --exclude='./__pycache__' \
+            --exclude='./data' \
+            --exclude='./data/*' \
+            --exclude='./hip-parser-deploy.tar.gz' \
+            -czf hip-parser-deploy.tar.gz \
+            .
+
+      - name: Upload deploy archive
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          source: hip-parser-deploy.tar.gz
+          target: /tmp
+          overwrite: true
+
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -23,16 +48,41 @@ jobs:
           port: ${{ secrets.SSH_PORT || '22' }}
           script_stop: true
           script: |
-            set -e
-            cd ${{ secrets.DEPLOY_PATH }}
-            git fetch --all --prune
-            git checkout main
-            git reset --hard origin/main
+            set -euo pipefail
+            DEPLOY_PATH='${{ secrets.DEPLOY_PATH }}'
+            ARCHIVE_PATH='/tmp/hip-parser-deploy.tar.gz'
+
+            if [ -z "$DEPLOY_PATH" ]; then
+              echo "DEPLOY_PATH secret is empty"
+              exit 1
+            fi
+
+            if [ "$DEPLOY_PATH" = "/" ]; then
+              echo "DEPLOY_PATH cannot be /"
+              exit 1
+            fi
+
             if [ -z "${{ secrets.ENV_FILE_B64 }}" ]; then
               echo "ENV_FILE_B64 secret is empty"
               exit 1
             fi
-            printf '%s' '${{ secrets.ENV_FILE_B64 }}' | base64 -d > .env
-            chmod 600 .env
+
+            mkdir -p "$DEPLOY_PATH"
+            mkdir -p "$DEPLOY_PATH/data"
+
+            find "$DEPLOY_PATH" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              ! -name data \
+              ! -name .env \
+              -exec rm -rf {} +
+
+            tar -xzf "$ARCHIVE_PATH" -C "$DEPLOY_PATH"
+            rm -f "$ARCHIVE_PATH"
+
+            printf '%s' '${{ secrets.ENV_FILE_B64 }}' | base64 -d > "$DEPLOY_PATH/.env"
+            chmod 600 "$DEPLOY_PATH/.env"
+
+            cd "$DEPLOY_PATH"
             docker compose up -d --build --remove-orphans
             docker image prune -f
