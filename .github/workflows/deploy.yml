@@ -18,14 +18,14 @@ jobs:
         run: |
           set -euo pipefail
           tar \
+            -C "$GITHUB_WORKSPACE" \
             --exclude-vcs \
             --exclude='./.env' \
             --exclude='./.venv' \
             --exclude='./__pycache__' \
             --exclude='./data' \
             --exclude='./data/*' \
-            --exclude='./hip-parser-deploy.tar.gz' \
-            -czf hip-parser-deploy.tar.gz \
+            -czf "$RUNNER_TEMP/hip-parser-deploy.tar.gz" \
             .
 
       - name: Upload deploy archive
@@ -35,7 +35,7 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT || '22' }}
-          source: hip-parser-deploy.tar.gz
+          source: ${{ runner.temp }}/hip-parser-deploy.tar.gz
           target: /tmp
           overwrite: true
 
