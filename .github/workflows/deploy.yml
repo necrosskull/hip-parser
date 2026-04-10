@@ -17,6 +17,7 @@ jobs:
       - name: Create deploy archive
         run: |
           set -euo pipefail
+          rm -f "$GITHUB_WORKSPACE/hip-parser-deploy.tar.gz"
           tar \
             -C "$GITHUB_WORKSPACE" \
             --exclude-vcs \
@@ -25,8 +26,10 @@ jobs:
             --exclude='./__pycache__' \
             --exclude='./data' \
             --exclude='./data/*' \
+            --exclude='./hip-parser-deploy.tar.gz' \
             -czf "$RUNNER_TEMP/hip-parser-deploy.tar.gz" \
             .
+          cp "$RUNNER_TEMP/hip-parser-deploy.tar.gz" "$GITHUB_WORKSPACE/hip-parser-deploy.tar.gz"
 
       - name: Upload deploy archive
         uses: appleboy/scp-action@v0.1.7
@@ -35,7 +38,7 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.SSH_PORT || '22' }}
-          source: ${{ runner.temp }}/hip-parser-deploy.tar.gz
+          source: hip-parser-deploy.tar.gz
           target: /tmp
           overwrite: true
 
@@ -52,6 +55,46 @@ jobs:
             DEPLOY_PATH='${{ secrets.DEPLOY_PATH }}'
             ARCHIVE_PATH='/tmp/hip-parser-deploy.tar.gz'
 
+            ensure_writable_dir() {
+              target_dir="$1"
+
+              if [ -d "$target_dir" ] && [ -w "$target_dir" ]; then
+                return 0
+              fi
+
+              if mkdir -p "$target_dir" 2>/dev/null && [ -w "$target_dir" ]; then
+                return 0
+              fi
+
+              if command -v sudo >/dev/null 2>&1; then
+                sudo -n mkdir -p "$target_dir"
+                sudo -n chown -R "$(id -un)":"$(id -gn)" "$target_dir"
+              else
+                echo "Cannot create $target_dir. Grant write access to $(id -un) or enable passwordless sudo."
+                exit 1
+              fi
+
+              if [ ! -w "$target_dir" ]; then
+                echo "$target_dir is still not writable for $(id -un)"
+                exit 1
+              fi
+            }
+
+            run_docker() {
+              if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+                docker "$@"
+                return 0
+              fi
+
+              if command -v sudo >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
+                sudo -n docker "$@"
+                return 0
+              fi
+
+              echo "Docker is unavailable for $(id -un). Add the user to the docker group or enable passwordless sudo for docker."
+              exit 1
+            }
+
             if [ -z "$DEPLOY_PATH" ]; then
               echo "DEPLOY_PATH secret is empty"
               exit 1
@@ -67,8 +110,13 @@ jobs:
               exit 1
             fi
 
-            mkdir -p "$DEPLOY_PATH"
-            mkdir -p "$DEPLOY_PATH/data"
+            ensure_writable_dir "$DEPLOY_PATH"
+            ensure_writable_dir "$DEPLOY_PATH/data"
+
+            if [ ! -f "$ARCHIVE_PATH" ]; then
+              echo "Deploy archive not found at $ARCHIVE_PATH"
+              exit 1
+            fi
 
             find "$DEPLOY_PATH" \
               -mindepth 1 \
@@ -84,5 +132,5 @@ jobs:
             chmod 600 "$DEPLOY_PATH/.env"
 
             cd "$DEPLOY_PATH"
-            docker compose up -d --build --remove-orphans
-            docker image prune -f
+            run_docker compose up -d --build --remove-orphans
+            run_docker image prune -f
